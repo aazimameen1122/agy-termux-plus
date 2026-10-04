@@ -1,0 +1,87 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# agy-proxyctl — manage the shared termux-http-proxy daemon.
+#
+# The agy wrapper starts an ephemeral proxy per run when none is listening.
+# A shared daemon is nicer: one proxy for agy and every other musl tool,
+# with connection logging and a deny list you can change live.
+#
+#   agy-proxyctl start [--log FILE]   start the shared daemon on 127.0.0.1:18080
+#   agy-proxyctl stop                 stop it
+#   agy-proxyctl restart              stop, then start
+#   agy-proxyctl status               is it listening?
+#   agy-proxyctl log                  tail its connection log
+#
+# The auth token lives at ~/.config/termux-http-proxy/token (0600) — the same
+# file the agy wrapper reads, so the wrapper picks up this daemon automatically.
+#
+# Not "#!/usr/bin/env bash": Android has no /usr/bin/env.
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  link="$(readlink "$SELF")"
+  case "$link" in /*) SELF="$link" ;; *) SELF="$(dirname "$SELF")/$link" ;; esac
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd -P)"
+PROXY="$HERE/termux-http-proxy"
+[ -x "$PROXY" ] || [ ! -x "$HERE/dns-proxy" ] || PROXY="$HERE/dns-proxy"
+
+PORT=18080
+CONFDIR="$HOME/.config/termux-http-proxy"
+TOKEN_FILE="$CONFDIR/token"
+STATE_FILE="$CONFDIR/proxyctl.state"
+DEFAULT_LOG="$CONFDIR/connections.log"
+
+die() { echo "agy-proxyctl: $*" >&2; exit 1; }
+port_open() { python3 -c "import socket; socket.create_connection(('127.0.0.1',$1),timeout=2).close()" 2>/dev/null; }
+proxy_pids() { pgrep -f "termux-http-proxy.*--port $PORT" 2>/dev/null || pgrep -f "dns-proxy.*--port $PORT" 2>/dev/null || true; }
+
+cmd="${1:-status}"; shift || true
+case "$cmd" in
+  start)
+    LOG="$DEFAULT_LOG"
+    while [ $# -gt 0 ]; do case "$1" in --log) shift; LOG="${1:?--log needs a file}";; *) die "unknown option $1";; esac; shift; done
+    [ -x "$PROXY" ] || die "proxy binary missing — run ./install.sh first"
+    if port_open "$PORT"; then echo "already listening on 127.0.0.1:$PORT"; exit 0; fi
+    pids="$(proxy_pids)"; [ -n "$pids" ] && kill $pids 2>/dev/null || true
+    mkdir -p "$CONFDIR" && chmod 700 "$CONFDIR"
+    [ -f "$TOKEN_FILE" ] || { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"; }
+    # Detaches itself with --port; --log records one line per connection.
+    "$PROXY" --port "$PORT" --auth-file "$TOKEN_FILE" --log "$LOG" \
+      || die "proxy would not start"
+    sleep 1
+    if port_open "$PORT"; then
+      printf 'port=%s\nlog=%s\n' "$PORT" "$LOG" > "$STATE_FILE"
+      echo "proxy listening on 127.0.0.1:$PORT (token: $TOKEN_FILE, log: $LOG)"
+      echo "the agy wrapper will use it automatically."
+    else
+      die "proxy started but port $PORT is not answering"
+    fi
+    ;;
+  stop)
+    pids="$(proxy_pids)"
+    if [ -z "$pids" ] && ! port_open "$PORT"; then echo "not running."; exit 0; fi
+    [ -n "$pids" ] && kill $pids 2>/dev/null
+    sleep 1
+    if port_open "$PORT"; then [ -n "$pids" ] && kill -9 $pids 2>/dev/null; sleep 1; fi
+    port_open "$PORT" && die "would not stop" || echo "stopped."
+    ;;
+  restart) "$0" stop; exec "$0" start "$@" ;;
+  status)
+    if port_open "$PORT"; then
+      echo "listening on 127.0.0.1:$PORT  (pids: $(proxy_pids | tr '\n' ' '))"
+      [ -f "$STATE_FILE" ] && { echo "--- state ---"; cat "$STATE_FILE"; }
+    else
+      echo "not listening on 127.0.0.1:$PORT"
+      echo "start it with: agy-proxyctl start"
+      exit 1
+    fi
+    ;;
+  log)
+    LOG="$DEFAULT_LOG"; [ -f "$STATE_FILE" ] && LOG="$(grep -E '^log=' "$STATE_FILE" | cut -d= -f2-)"
+    [ -f "$LOG" ] || die "no log at $LOG (start with --log to enable it)"
+    tail -n 50 -f "$LOG"
+    ;;
+  -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; ;;
+  *) die "unknown command '$cmd' (start|stop|restart|status|log)" ;;
+esac

@@ -1,0 +1,200 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Run the musl-patched Antigravity CLI on Termux.
+#
+# Starts the bionic-side proxy (termux-http-proxy) (musl has no /etc/resolv.conf on Android, so
+# DNS inside the process is dead) and points agy at it, then runs the binary.
+#
+#   AGY_NO_PROXY=1   use ambient proxy settings instead of starting one
+#   TERMUX_PROXY_TOKEN_FILE  proxy token (default ~/.config/termux-http-proxy/token)
+#   AGY_NO_REPAIR=1  report a replaced agy.bin instead of repatching it
+#   AGY_ALLOW_UPDATE=1  let agy's background auto-updater run (off by default)
+#   AGY_ENV_PASS="A B"  also pass these environment variables to agy
+#   AGY_ENV_ALL=1    pass the whole environment (no allowlist)
+#
+# Not "#!/usr/bin/env bash": Android has no /usr/bin/env.
+set -euo pipefail
+
+# Resolve through a symlink: ~/.local/bin/agy points here, but the binary,
+# shim and proxy all live beside this script in the repo.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  link="$(readlink "$SELF")"
+  case "$link" in /*) SELF="$link" ;; *) SELF="$(dirname "$SELF")/$link" ;; esac
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd -P)"
+BIN="$HERE/agy.bin"
+PROXY="$HERE/termux-http-proxy"
+# Built under its old name by an install from before the rename.
+[ -x "$PROXY" ] || [ ! -x "$HERE/dns-proxy" ] || PROXY="$HERE/dns-proxy"
+
+LIBDIR="$HERE/lib"
+
+# Read PT_INTERP out of the ELF. patchelf moves it into a segment of its own at
+# the end of the file, so there is no fixed place to look for it.
+# (Defined before the checks below that use it.)
+elf_interp() {
+  local f="$1" phoff phentsize phnum words i base lo hi off sz
+  [ "$(od -An -tx1 -N4 "$f" | tr -d ' ')" = "7f454c46" ] || return 1
+  phoff="$(od -An -tu8 -j32 -N8 -v "$f" | tr -d ' ')"
+  read -r phentsize phnum < <(od -An -tu2 -j54 -N4 -v "$f")
+  words=($(od -An -tu4 -j"$phoff" -N"$((phentsize * phnum))" -v "$f"))
+  for ((i = 0; i < phnum; i++)); do
+    base=$((i * phentsize / 4))
+    [ "${words[base]}" = 3 ] || continue          # PT_INTERP
+    lo="${words[base + 2]}"; hi="${words[base + 3]}"
+    off=$((hi * 4294967296 + lo)); sz="${words[base + 8]}"
+    dd if="$f" bs=1 skip="$off" count="$sz" 2>/dev/null | tr -d "\0"
+    return 0
+  done
+  return 1
+}
+
+[ -x "$BIN" ] || { echo "agy: $BIN is missing" >&2; exit 1; }
+# The shim is only needed for the dynamic (glibc-origin) build; Google's
+# official musl build is static and never gets one.
+if [ -n "$(elf_interp "$BIN" || true)" ]; then
+  [ -e "$LIBDIR/libagyshim.so" ] || { echo "agy: shim missing from $LIBDIR" >&2; exit 1; }
+fi
+
+: "${PREFIX:=/data/data/com.termux/files/usr}"
+LOADER="$LIBDIR/ld-musl-aarch64.so.1"
+
+# agy updates itself in the background: it renames agy.bin to
+# agy.bin.<nanos>.old and writes a stock Google build in its place, undoing
+# every patch install.sh applied. That build asks for glibc's loader, which
+# Android does not have, and the only thing the user sees is "cannot execute:
+# required file not found". Catch it here, where the cause can be named.
+#
+# A static binary (Google's official musl build) has no PT_INTERP at all and
+# needs no repair; anything else must be our vendored musl loader.
+interp="$(elf_interp "$BIN" || true)"
+if [ -n "$interp" ] && [ "$interp" != "$LOADER" ]; then
+  echo "agy: agy.bin is not linked against musl -- the auto-updater has" >&2
+  echo "     replaced it with a stock build." >&2
+  if [ -n "${AGY_NO_REPAIR:-}" ] || [ ! -x "$HERE/install.sh" ]; then
+    echo "     Repatch it with: $HERE/install.sh --from-binary $BIN" >&2
+    exit 1
+  fi
+  echo "agy: re-applying the patches to the new version..." >&2
+  # install.sh verifies by running its own build now, so it no longer re-enters
+  # this script; AGY_NO_REPAIR stays as a stop against any path that does. If
+  # the patching fails, install.sh leaves agy.bin untouched and exits non-zero.
+  AGY_NO_REPAIR=1 "$HERE/install.sh" --from-binary "$BIN" >&2 \
+    || { echo "agy: could not repatch agy.bin" >&2; exit 1; }
+fi
+
+# ...and stop it happening again. agy checks this before spawning the updater:
+#
+#   auto_updater.go:247  Auto-update disabled via environment variable
+#                        AGY_CLI_DISABLE_AUTO_UPDATE
+#
+# The value must be exactly "true". The binary compares four bytes against
+# 0x65757274 and ignores everything else, "1" included, without saying so.
+# Update deliberately instead: ./agy-update, or AGY_ALLOW_UPDATE=1 for one run.
+if [ -z "${AGY_ALLOW_UPDATE:-}" ]; then
+  export AGY_CLI_DISABLE_AUTO_UPDATE="${AGY_CLI_DISABLE_AUTO_UPDATE:-true}"
+fi
+
+# The proxy can require a token (--auth-file): Android's loopback is reachable by every
+# app on the device, so without one any app could use it as an open relay. The token
+# lives where only Termux can read it. Credentials sent to a proxy that does not ask
+# for them are ignored, so this works whether or not the shared daemon requires them.
+# The username is not checked; it names this tool in the proxy's connection log.
+PROXY_TOKEN_FILE="${TERMUX_PROXY_TOKEN_FILE:-$HOME/.config/termux-http-proxy/token}"
+proxy_url() {
+  local token=""
+  if [ -r "$PROXY_TOKEN_FILE" ]; then
+    token="$(tr -d '[:space:]' < "$PROXY_TOKEN_FILE")"
+  fi
+  if [ -n "$token" ]; then
+    printf 'http://agy:%s@127.0.0.1:%s' "$token" "$1"
+  else
+    printf 'http://127.0.0.1:%s' "$1"
+  fi
+}
+
+PROXY_PID=""
+cleanup() { [ -n "${PROXY_PID:-}" ] && kill "$PROXY_PID" 2>/dev/null; return 0; }
+trap cleanup EXIT HUP INT TERM
+
+if [ -z "${AGY_NO_PROXY:-}" ]; then
+  if [ -n "${HTTP_PROXY:-${http_proxy:-}}" ]; then
+    : # Ambient proxy already configured
+  elif nc -z 127.0.0.1 18080 2>/dev/null; then
+    export http_proxy="$(proxy_url 18080)"
+    export https_proxy="$http_proxy"
+    export HTTP_PROXY="$http_proxy"
+    export HTTPS_PROXY="$http_proxy"
+    export all_proxy="$http_proxy"
+  elif [ -x "$PROXY" ]; then
+    # The proxy prints its port on stdout then serves until killed.
+    FIFO="$(mktemp -u "${TMPDIR:-/data/data/com.termux/files/usr/tmp}/agy-proxy.XXXXXX")"
+    if mkfifo "$FIFO" 2>/dev/null; then
+      # Creates the token (random, 0600) on first use.
+      mkdir -p "${PROXY_TOKEN_FILE%/*}" && chmod 700 "${PROXY_TOKEN_FILE%/*}"
+      "$PROXY" --auth-file "$PROXY_TOKEN_FILE" > "$FIFO" 2>/dev/null &
+      PROXY_PID=$!
+      read -r -t 15 PORT < "$FIFO" || true
+      rm -f "$FIFO"
+      if [ -n "${PORT:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+        export http_proxy="$(proxy_url "$PORT")"
+        export https_proxy="$http_proxy"
+        export HTTP_PROXY="$http_proxy"
+        export HTTPS_PROXY="$http_proxy"
+        export all_proxy="$http_proxy"
+      else
+        PROXY_PID=""
+        echo "agy: proxy did not start; network will not work" >&2
+      fi
+    fi
+  fi
+fi
+
+# Go's crypto/x509 looks for a CA bundle at the standard Linux paths
+# (/etc/ssl/certs/ca-certificates.crt and friends). Android has none of them, so
+# every TLS verification fails with "certificate signed by unknown authority" --
+# including the OAuth token-exchange POST, which makes login impossible. Termux
+# ships the bundle at $PREFIX/etc/tls/cert.pem; point Go at it.
+if [ -z "${SSL_CERT_FILE:-}" ] && [ -r "$PREFIX/etc/tls/cert.pem" ]; then
+  export SSL_CERT_FILE="$PREFIX/etc/tls/cert.pem"
+fi
+[ -n "${SSL_CERT_DIR:-}" ] || export SSL_CERT_DIR="$PREFIX/etc/tls"
+
+# Termux preloads a bionic library that a musl process cannot relocate.
+unset LD_PRELOAD
+
+# Start agy with an allowlisted environment. Its file tools can read
+# /proc/self/environ like any other file, and whatever a tool reads is sent to
+# the model: an API key exported for some unrelated tool goes along with it.
+# Commands agy runs inherit the same environment, so the list keeps what a
+# Termux shell needs (Android's variables, for am and termux-api among them),
+# what agy reads itself, and what the wrapper set above.
+agy_env() {
+  local name
+  while IFS= read -r name; do
+    case "$name" in
+      HOME|PATH|PWD|SHELL|USER|LOGNAME|TMPDIR|PREFIX|TZ|LANG|LANGUAGE|LC_*) ;;
+      TERM|COLORTERM|TERM_PROGRAM|TERM_PROGRAM_VERSION|COLUMNS|LINES|NO_COLOR) ;;
+      EDITOR|VISUAL|PAGER|XDG_*) ;;
+      ANDROID_*|BOOTCLASSPATH|DEX2OATBOOTCLASSPATH|SYSTEMSERVERCLASSPATH) ;;
+      EXTERNAL_STORAGE|TERMUX_*) ;;
+      AGY_*|ANTIGRAVITY_*|GEMINI_*|GOOGLE_*|CLOUDSDK_*) ;;
+      http_proxy|https_proxy|all_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY) ;;
+      SSL_CERT_FILE|SSL_CERT_DIR) ;;
+      *) [[ " ${AGY_ENV_PASS:-} " == *" $name "* ]] || continue ;;
+    esac
+    printf '%s=%s\0' "$name" "${!name}"
+  done < <(compgen -e)
+}
+
+# Deliberately not exec: the EXIT trap is what stops the proxy, and exec would
+# replace this shell and orphan it. One idle shell buys deterministic cleanup.
+if [ -n "${AGY_ENV_ALL:-}" ]; then
+  "$BIN" "$@"
+else
+  mapfile -d '' -t AGY_ENV < <(agy_env)
+  env -i "${AGY_ENV[@]}" "$BIN" "$@"
+fi
+rc=$?
+cleanup
+exit "$rc"
