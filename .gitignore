@@ -1,0 +1,7 @@
+agy.bin*
+termux-http-proxy
+dns-proxy
+*.tar.gz
+lib/*.so
+.update.*
+__pycache__/
