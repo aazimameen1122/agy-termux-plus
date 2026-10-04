@@ -1,0 +1,133 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# agy-login — one-command Google sign-in for agy on Termux.
+#
+# If you're already signed in, it just says so. If not, it launches agy's
+# sign-in (bare `agy` — `agy models` only errors out when logged out), opens
+# the Google auth page in your browser automatically (and copies the link to
+# the clipboard as backup), waits for the token to land, and verifies.
+# The Google sign-in itself is the only step left for you.
+#
+#   ./agy-login
+#
+# Not "#!/usr/bin/env bash": Android has no /usr/bin/env.
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  link="$(readlink "$SELF")"
+  case "$link" in /*) SELF="$link" ;; *) SELF="$(dirname "$SELF")/$link" ;; esac
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd -P)"
+AGY="$HERE/agy"
+TOKEN="$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
+die()  { echo "agy-login: $*" >&2; exit 1; }
+token_id() { stat -c '%Y %s' "$TOKEN" 2>/dev/null || echo none; }
+
+[ -x "$AGY" ] || die "agy wrapper not found at $AGY (run ./install.sh first)"
+
+agy_pid=""; out=""; tail_pid=""
+cleanup() {
+  [ -n "$tail_pid" ] && kill "$tail_pid" 2>/dev/null
+  [ -n "$agy_pid" ] && kill "$agy_pid" 2>/dev/null
+  [ -n "$out" ] && rm -f "$out"
+  return 0
+}
+trap cleanup INT TERM
+
+# --- fast check: `agy models` errors immediately when logged out --------------
+say "checking sign-in..."
+chk="$(mktemp)"
+timeout 60 "$AGY" models >"$chk" 2>&1; rc=$?
+if [ "$rc" -eq 0 ] && ! grep -q -E "Please sign in|Authentication required" "$chk"; then
+  say "already signed in — models are reachable"
+  grep -o -E 'gemini-[a-z0-9.-]+' "$chk" | sort -u | head -5
+  rm -f "$chk"; trap - INT TERM; exit 0
+fi
+if ! grep -q -E "Please sign in|Authentication required" "$chk"; then
+  echo "--- agy said: ---"; tail -20 "$chk"
+  rm -f "$chk"; trap - INT TERM
+  die "sign-in check failed (see above) — try ./agy-doctor"
+fi
+rm -f "$chk"
+
+# --- login flow: bare `agy` prints "visit the URL to log in" and waits -------
+token_before="$(token_id)"
+
+ATTEMPTS=3
+attempt=1
+while [ "$attempt" -le "$ATTEMPTS" ]; do
+  say "starting sign-in (attempt $attempt/$ATTEMPTS)..."
+  say "agy's own output appears below — if it stalls here, tell me the last line you see"
+  out="$(mktemp)"
+  # stdin from /dev/null: once the token lands we kill agy anyway; if the
+  # interactive UI starts first, it sees EOF and exits on its own.
+  # timeout is a backstop so a hung agy can never block this forever.
+  COLUMNS=200 timeout 150 "$AGY" </dev/null >"$out" 2>&1 &
+  agy_pid=$!
+  # Stream agy's output live: silence is what makes a stall look like a hang.
+  tail -n +1 -f "$out" 2>/dev/null &
+  tail_pid=$!
+  quiet() { kill "$tail_pid" 2>/dev/null; wait "$tail_pid" 2>/dev/null || true; }
+
+  # Wait up to ~45s for the auth prompt and grab the URL.
+  url=""
+  for _ in $(seq 1 45); do
+    if grep -q "Authentication required" "$out" 2>/dev/null; then
+      url="$(grep -A1 "log in:" "$out" | tr -d '\n' | grep -o -E 'https://[^[:space:]"]+' | head -1)"
+      [ -z "$url" ] && url="$(grep -o -E 'https://[^[:space:]"]+' "$out" | head -1)"
+      break
+    fi
+    if ! kill -0 "$agy_pid" 2>/dev/null; then break; fi
+    sleep 1
+  done
+
+  if [ -n "$url" ]; then
+    say "opening the Google sign-in page..."
+    if have termux-clipboard-set; then
+      printf '%s' "$url" | termux-clipboard-set 2>/dev/null \
+        && echo "(sign-in link also copied to clipboard)"
+    fi
+    if have termux-open-url; then
+      termux-open-url "$url" 2>/dev/null \
+        || echo "couldn't open the browser automatically — open this URL: $url"
+    else
+      echo "open this URL in your browser: $url"
+      echo "(install the Termux:API app + pkg install termux-api to auto-open it next time)"
+    fi
+    echo "Complete the Google sign-in, then return here (agy waits ~60s)."
+  fi
+
+  # The login writes the OAuth token file on success — that is the signal.
+  # agy's own auth wait is ~60s, so watching longer than ~80s is pointless.
+  won=0
+  for _ in $(seq 1 40); do
+    if [ "$(token_id)" != "$token_before" ] && [ -s "$TOKEN" ]; then won=1; break; fi
+    if ! kill -0 "$agy_pid" 2>/dev/null; then break; fi
+    sleep 2
+  done
+  quiet
+  [ -n "$agy_pid" ] && kill "$agy_pid" 2>/dev/null
+  wait "$agy_pid" 2>/dev/null || true
+  agy_pid=""
+
+  if [ "$won" = 1 ]; then
+    say "signed in — verifying..."
+    if timeout 60 "$AGY" models >"$out" 2>&1 && ! grep -q -E "Please sign in|Authentication required" "$out"; then
+      say "done. You're signed in."
+      grep -o -E 'gemini-[a-z0-9.-]+' "$out" | sort -u | head -5
+      rm -f "$out"; out=""; trap - INT TERM; exit 0
+    fi
+    echo "verification didn't pass; retrying..."
+  else
+    echo "that attempt timed out or failed."
+  fi
+  token_before="$(token_id)"
+  rm -f "$out"; out=""
+  attempt=$((attempt + 1))
+done
+
+trap - INT TERM
+die "couldn't complete sign-in after $ATTEMPTS attempts — run ./agy-doctor and check the network/proxy"
