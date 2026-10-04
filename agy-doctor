@@ -1,0 +1,184 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# agy-doctor — diagnose an agy-termux-plus install.
+#
+# Runs a battery of checks (architecture, toolchain, musl loader, shim,
+# patch state, proxy, DNS, TLS, termux-api, git/curl health, disk, login
+# state) and prints PASS/WARN/FAIL for each, with a concrete fix hint.
+#
+#   ./agy-doctor            full check
+#   ./agy-doctor --quick    skip the slow network checks (git/curl/DNS)
+#
+# Not "#!/usr/bin/env bash": Android has no /usr/bin/env.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+BIN="$HERE/agy.bin"
+LIBDIR="$HERE/lib"
+LOADER="$LIBDIR/ld-musl-aarch64.so.1"
+: "${PREFIX:=/data/data/com.termux/files/usr}"
+
+QUICK=0
+[ "${1:-}" = "--quick" ] && QUICK=1
+
+GREEN='\033[32m'; YELLOW='\033[33m'; RED='\033[31m'; BOLD='\033[1m'; RESET='\033[0m'
+pass=0; warn=0; fail=0
+
+ok()   { printf "${GREEN}PASS${RESET} %s\n" "$1"; pass=$((pass+1)); }
+warn() { printf "${YELLOW}WARN${RESET} %s\n" "$1"; [ -n "${2:-}" ] && printf "       -> %s\n" "$2"; warn=$((warn+1)); }
+bad()  { printf "${RED}FAIL${RESET} %s\n" "$1"; [ -n "${2:-}" ] && printf "       -> %s\n" "$2"; fail=$((fail+1)); }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+printf "${BOLD}agy-termux-plus doctor${RESET}  (%s)\n\n" "$HERE"
+
+# --- platform ----------------------------------------------------------------
+if [ "$(uname -m)" = "aarch64" ]; then
+  ok "architecture is aarch64 ($(uname -m))"
+else
+  bad "architecture is $(uname -m), this project targets aarch64" "it will not run here"
+fi
+if [ -d "/data/data/com.termux" ]; then
+  ok "running inside Termux"
+else
+  warn "not inside Termux (PREFIX=$PREFIX)" "some checks assume a Termux layout"
+fi
+
+# --- toolchain ----------------------------------------------------------------
+for t in curl tar python3 git; do
+  if have "$t"; then ok "tool present: $t"; else bad "tool missing: $t" "pkg install $t"; fi
+done
+if have cc || have clang || have gcc; then ok "C compiler present"; else bad "no C compiler" "pkg install clang"; fi
+if have patchelf; then ok "patchelf present"; else warn "patchelf missing" "install.sh installs it on demand (pkg install patchelf)"; fi
+
+# --- vendored files ------------------------------------------------------------
+if [ -f "$LOADER" ]; then ok "musl loader vendored (lib/ld-musl-aarch64.so.1)"; else bad "musl loader missing at $LOADER" "re-clone the repo, lib/ is checked in"; fi
+if [ -f "$LIBDIR/libagyshim.so" ]; then
+  ok "compatibility shim built (lib/libagyshim.so)"
+  SHIM_OK=1
+else
+  SHIM_OK=0
+fi
+
+# --- installed binary -----------------------------------------------------------
+if [ ! -f "$BIN" ]; then
+  bad "agy.bin not installed" "./install.sh"
+else
+  # PT_INTERP must be our musl loader (stock Google builds ask for glibc's).
+  interp="$(python3 - "$BIN" <<'EOF' 2>/dev/null
+import struct, sys
+p = sys.argv[1]
+with open(p, "rb") as f:
+    d = f.read(64)
+    if d[:4] != b"\x7fELF": sys.exit(1)
+    phoff, = struct.unpack("<Q", d[32:40])
+    phentsize, phnum = struct.unpack("<HH", d[54:58])
+    f.seek(phoff)
+    ph = f.read(phentsize * phnum)
+    for i in range(phnum):
+        e = ph[i*phentsize:(i+1)*phentsize]
+        ptype, = struct.unpack("<I", e[:4])
+        if ptype == 3:  # PT_INTERP
+            off, = struct.unpack("<Q", e[16:24]); sz, = struct.unpack("<Q", e[32:40])
+            f.seek(off); sys.stdout.write(f.read(sz).split(b"\0")[0].decode()); break
+EOF
+)"
+  if [ "$interp" = "$LOADER" ]; then
+    ok "agy.bin interpreter is the vendored musl loader"
+  elif [ -z "$interp" ]; then
+    ok "agy.bin is a static musl build (no loader needed)"
+  else
+    bad "agy.bin interpreter is '${interp}'" "a stock build landed (auto-updater?) — run ./install.sh --from-binary $BIN"
+  fi
+  # A static install correctly has no shim; a dynamic one needs it.
+  if [ -z "$interp" ]; then
+    [ "$SHIM_OK" = 1 ] && ok "shim present (unused by static builds)" || ok "no shim (correct for static builds)"
+  elif [ "$SHIM_OK" = 1 ]; then
+    ok "shim matches the dynamic build"
+  else
+    warn "shim not built yet" "./install.sh builds it"
+  fi
+  # patch state via patch.py --dry-run: "would patch 0" == fully patched.
+  if have python3 && [ -f "$HERE/patch.py" ]; then
+    dry="$(python3 "$HERE/patch.py" --dry-run "$BIN" 2>&1)"; rc=$?
+    n="$(printf '%s' "$dry" | grep -oE 'would patch [0-9]+' | grep -oE '[0-9]+' || true)"
+    if [ $rc -eq 0 ] && [ "${n:-x}" = "0" ]; then
+      ok "binary patches verified (14 sites, 56 bytes)"
+    elif [ $rc -eq 0 ] && [ -n "$n" ]; then
+      bad "agy.bin is missing $n patch site(s)" "./install.sh --from-binary $BIN"
+    else
+      bad "patch.py could not read agy.bin" "the binary may be corrupt — reinstall with ./install.sh"
+    fi
+  fi
+  v="$(env -u LD_PRELOAD "$BIN" --version 2>&1 | head -1 || true)"
+  case "$v" in *[0-9].[0-9]*) ok "agy.bin runs (reports $v)";; *) bad "agy.bin does not start (said: ${v:-nothing})" "see Troubleshooting in README.md";; esac
+fi
+
+# --- proxy / DNS ------------------------------------------------------------------
+port_open() { python3 -c "import socket,sys; s=socket.create_connection(('127.0.0.1',$1),timeout=2); s.close()" 2>/dev/null; }
+proxy_up=""
+for p in 18080; do port_open "$p" && proxy_up="$p" && break; done
+if [ -n "$proxy_up" ]; then
+  ok "proxy answering on 127.0.0.1:$proxy_up"
+else
+  warn "no proxy on 127.0.0.1:18080" "./agy-proxyctl start  (the agy wrapper starts an ephemeral one per run)"
+fi
+
+# --- TLS ----------------------------------------------------------------------
+if [ -r "$PREFIX/etc/tls/cert.pem" ]; then
+  ok "CA bundle present (\$PREFIX/etc/tls/cert.pem)"
+else
+  bad "no CA bundle at \$PREFIX/etc/tls/cert.pem" "pkg install ca-certificates"
+fi
+
+# --- termux-api ------------------------------------------------------------------
+api=0
+for c in termux-notification termux-wake-lock termux-toast termux-clipboard-set termux-tts-speak; do
+  have "$c" && api=$((api+1))
+done
+if [ "$api" -ge 5 ]; then ok "Termux:API fully available (notifications, wake-lock, clipboard, TTS)"; elif [ "$api" -gt 0 ]; then warn "Termux:API partially available ($api/5 commands)" "update the Termux:API app + pkg install termux-api"; else warn "Termux:API not installed" "agy-run --notify/--copy need it: install the Termux:API app, then pkg install termux-api"; fi
+if [ -d "$HOME/.shortcuts" ]; then ok "Termux:Widget shortcuts dir exists (~/.shortcuts)"; else warn "~/.shortcuts missing" "./setup-widget.sh  (needs the Termux:Widget app)"; fi
+
+# --- network (slow; skipped with --quick) ------------------------------------------
+if [ "$QUICK" = 0 ]; then
+  # git over HTTPS — catches the libcurl/TLS skew some Termux installs hit.
+  if have git; then
+    gerr="$(timeout 25 git ls-remote https://github.com/google-antigravity/antigravity-cli HEAD 2>&1 >/dev/null || true)"
+    if [ -z "$gerr" ]; then
+      ok "git HTTPS works"
+    elif printf '%s' "$gerr" | grep -q "cannot locate symbol"; then
+      sym="$(printf '%s' "$gerr" | grep -oE 'cannot locate symbol [^ ]+[^"]*' | head -1)"
+      bad "git HTTPS broken: $sym" "libcurl/TLS skew — run: pkg upgrade -y   (until then, use the python3 downloader in install.sh)"
+    else
+      warn "git HTTPS failed: $(printf '%s' "$gerr" | head -1)" "check connectivity; install.sh can fall back to wget/python3"
+    fi
+  fi
+  # DNS through the proxy, the way agy itself resolves.
+  if [ -n "$proxy_up" ] && have python3; then
+    if https_proxy="http://127.0.0.1:$proxy_up" timeout 25 python3 -c "
+import urllib.request
+urllib.request.urlopen('https://www.google.com/generate_204', timeout=20)" 2>/dev/null; then
+      ok "HTTPS through the proxy works (DNS + TLS)"
+    else
+      warn "HTTPS through the proxy failed" "check the proxy log: ./agy-proxyctl log"
+    fi
+  fi
+else
+  echo "(network checks skipped — run without --quick for git/curl/DNS)"
+fi
+
+# --- resources ---------------------------------------------------------------------
+avail_mb="$(df -Pm "$HERE" 2>/dev/null | awk 'NR==2{print $4}')"
+if [ -n "$avail_mb" ]; then
+  if [ "$avail_mb" -ge 600 ]; then ok "disk: ${avail_mb}MB free"; else warn "disk: only ${avail_mb}MB free" "updates need ~600MB scratch"; fi
+fi
+
+# --- login state ---------------------------------------------------------------------
+if [ -f "$HOME/.gemini/antigravity-cli/antigravity-oauth-token" ]; then
+  ok "Google OAuth token present (logged in)"
+else
+  warn "no OAuth token found" "run: ./agy-login   (opens the Google sign-in for you)"
+fi
+
+echo
+printf "${BOLD}result: ${GREEN}%d pass${RESET}, ${YELLOW}%d warn${RESET}, ${RED}%d fail${RESET}\n" "$pass" "$warn" "$fail"
+[ "$fail" -eq 0 ]
